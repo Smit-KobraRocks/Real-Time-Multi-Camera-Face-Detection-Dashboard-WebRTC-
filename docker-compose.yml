@@ -1,0 +1,161 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-face_detection}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-face_detection}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-face_detection}}
+        PRISMA_VERSION: ${PRISMA_VERSION:-5.15.0}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: ${BACKEND_PORT:-3000}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-face_detection}}
+      JWT_SECRET: ${JWT_SECRET:-change-me}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+      - public
+    ports:
+      - "${BACKEND_PORT:-3000}:3000"
+    command: ["sh", "-c", "npx prisma migrate deploy && node dist/server/index.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - public
+    ports:
+      - "${FRONTEND_PORT:-4173}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${WORKER_LOG_LEVEL:-info}
+      BACKEND_BASE_URL: ${WORKER_BACKEND_BASE_URL:-http://backend:3000}
+      BACKEND_ALERT_ENDPOINT: ${WORKER_BACKEND_ALERT_ENDPOINT:-/alerts}
+      MEDIAMTX_URL: ${MEDIAMTX_URL:-rtsp://mediamtx:8554}
+      PROCESSING_FPS: ${PROCESSING_FPS:-15}
+      FFMPEG_BIN: ${FFMPEG_BIN:-ffmpeg}
+      API_ADDRESS: ${WORKER_API_ADDRESS:-:8080}
+      CAMERA_CONFIGS: ${CAMERA_CONFIGS:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    networks:
+      - backend
+    ports:
+      - "${WORKER_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.0
+    restart: unless-stopped
+    environment:
+      MTX_PROTOCOLS: tcp
+    networks:
+      - backend
+    ports:
+      - "${MEDIAMTX_RTSP_PORT:-8554}:8554"
+      - "${MEDIAMTX_RTMP_PORT:-1935}:1935"
+      - "${MEDIAMTX_HLS_PORT:-8888}:8888"
+      - "${MEDIAMTX_WEBRTC_PORT:-8889}:8889"
+      - "${MEDIAMTX_WEBRTC_UDP_PORT:-8189}:8189/udp"
+      - "${MEDIAMTX_API_PORT:-9997}:9997"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9997/v1/server/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  proxy:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    volumes:
+      - ./docker/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - backend
+      - public
+    ports:
+      - "${PROXY_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  backend:
+    driver: bridge
+    internal: true
+  public:
+    driver: bridge
+
+volumes:
+  postgres_data:
